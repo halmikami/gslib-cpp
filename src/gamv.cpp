@@ -4,6 +4,10 @@
 #include <vector>
 #include <algorithm>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace gslib {
 
 VariogramResult gamv(
@@ -33,7 +37,6 @@ VariogramResult gamv(
     if (xltoll <= 0.0) xltoll = 0.5 * xlag;
 
     // Single direction, single variogram setup
-    // Compute direction vectors
     double azmuth = (90.0 - azm) * PI / 180.0;
     double uvxazm = std::cos(azmuth);
     double uvyazm = std::sin(azmuth);
@@ -46,23 +49,44 @@ VariogramResult gamv(
     double csdtol = (dtol <= 0.0) ? std::cos(45.0 * PI / 180.0)
                                   : std::cos(dtol * PI / 180.0);
 
-    // Allocate output arrays: n_lags + 2 bins (bin 0 = zero distance, bins 1..n_lags+1)
     int nbins = n_lags + 2;
-    std::vector<double> np_arr(nbins, 0.0);
-    std::vector<double> dis(nbins, 0.0);
-    std::vector<double> gam(nbins, 0.0);
-    std::vector<double> hm(nbins, 0.0);
-    std::vector<double> tm(nbins, 0.0);
-    std::vector<double> hv(nbins, 0.0);
-    std::vector<double> tv(nbins, 0.0);
-
     double dismxs = std::pow((static_cast<double>(n_lags) + 0.5 - 1.0e-20) * xlag, 2);
 
     bool use_bhid = !bhid.empty();
     bool omni = (atol >= 90.0);
 
-    // Main loop over all pairs
+    // Determine number of threads for OpenMP reduction
+#ifdef _OPENMP
+    int nthreads = omp_get_max_threads();
+#else
+    int nthreads = 1;
+#endif
+
+    // Per-thread accumulators
+    std::vector<std::vector<double>> t_np(nthreads, std::vector<double>(nbins, 0.0));
+    std::vector<std::vector<double>> t_dis(nthreads, std::vector<double>(nbins, 0.0));
+    std::vector<std::vector<double>> t_gam(nthreads, std::vector<double>(nbins, 0.0));
+    std::vector<std::vector<double>> t_hm(nthreads, std::vector<double>(nbins, 0.0));
+    std::vector<std::vector<double>> t_tm(nthreads, std::vector<double>(nbins, 0.0));
+    std::vector<std::vector<double>> t_hv(nthreads, std::vector<double>(nbins, 0.0));
+    std::vector<std::vector<double>> t_tv(nthreads, std::vector<double>(nbins, 0.0));
+
+    // Main loop over all pairs — OpenMP parallelized over outer loop
+    #pragma omp parallel for schedule(dynamic, 64)
     for (int i = 0; i < nd; i++) {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num();
+#else
+        int tid = 0;
+#endif
+        auto& np_arr = t_np[tid];
+        auto& dis_l  = t_dis[tid];
+        auto& gam_l  = t_gam[tid];
+        auto& hm_l   = t_hm[tid];
+        auto& tm_l   = t_tm[tid];
+        auto& hv_l   = t_hv[tid];
+        auto& tv_l   = t_tv[tid];
+
         for (int j = i + 1; j < nd; j++) {
             // Downhole constraint
             if (use_bhid && bhid[j] != bhid[i]) continue;
@@ -125,7 +149,7 @@ VariogramResult gamv(
             if (std::abs(band) > bandwd) continue;
 
             // Determine head/tail values
-            double vrh, vrt, vrhpr, vrtpr;
+            double vrh, vrt, vrhpr = 0.0, vrtpr = 0.0;
             if (dcazm >= 0.0 && dcdec >= 0.0) {
                 vrh = values[i];
                 vrt = values[j];
@@ -146,107 +170,115 @@ VariogramResult gamv(
             int it = ivtype;
 
             if (it == 1 || it == 5 || it >= 9) {
-                // Semivariogram (and indicator, general relative)
                 for (int il = lagbeg; il <= lagend; il++) {
                     np_arr[il] += 1.0;
-                    dis[il] += h;
-                    tm[il] += vrt;
-                    hm[il] += vrh;
-                    gam[il] += (vrh - vrt) * (vrh - vrt);
+                    dis_l[il] += h;
+                    tm_l[il] += vrt;
+                    hm_l[il] += vrh;
+                    gam_l[il] += (vrh - vrt) * (vrh - vrt);
                     if (omni) {
                         np_arr[il] += 1.0;
-                        dis[il] += h;
-                        tm[il] += vrtpr;
-                        hm[il] += vrhpr;
-                        gam[il] += (vrhpr - vrtpr) * (vrhpr - vrtpr);
+                        dis_l[il] += h;
+                        tm_l[il] += vrtpr;
+                        hm_l[il] += vrhpr;
+                        gam_l[il] += (vrhpr - vrtpr) * (vrhpr - vrtpr);
                     }
                 }
             } else if (it == 2) {
-                // Cross-semivariogram
                 for (int il = lagbeg; il <= lagend; il++) {
                     np_arr[il] += 1.0;
-                    dis[il] += h;
-                    tm[il] += 0.5 * (vrt + vrtpr);
-                    hm[il] += 0.5 * (vrh + vrhpr);
-                    gam[il] += (vrhpr - vrh) * (vrt - vrtpr);
+                    dis_l[il] += h;
+                    tm_l[il] += 0.5 * (vrt + vrtpr);
+                    hm_l[il] += 0.5 * (vrh + vrhpr);
+                    gam_l[il] += (vrhpr - vrh) * (vrt - vrtpr);
                 }
             } else if (it == 3) {
-                // Covariance
                 for (int il = lagbeg; il <= lagend; il++) {
                     np_arr[il] += 1.0;
-                    dis[il] += h;
-                    tm[il] += vrt;
-                    hm[il] += vrh;
-                    gam[il] += vrh * vrt;
+                    dis_l[il] += h;
+                    tm_l[il] += vrt;
+                    hm_l[il] += vrh;
+                    gam_l[il] += vrh * vrt;
                     if (omni) {
                         np_arr[il] += 1.0;
-                        dis[il] += h;
-                        tm[il] += vrtpr;
-                        hm[il] += vrhpr;
-                        gam[il] += vrhpr * vrtpr;
+                        dis_l[il] += h;
+                        tm_l[il] += vrtpr;
+                        hm_l[il] += vrhpr;
+                        gam_l[il] += vrhpr * vrtpr;
                     }
                 }
             } else if (it == 4) {
-                // Correlogram
                 for (int il = lagbeg; il <= lagend; il++) {
                     np_arr[il] += 1.0;
-                    dis[il] += h;
-                    tm[il] += vrt;
-                    hm[il] += vrh;
-                    hv[il] += vrh * vrh;
-                    tv[il] += vrt * vrt;
-                    gam[il] += vrh * vrt;
+                    dis_l[il] += h;
+                    tm_l[il] += vrt;
+                    hm_l[il] += vrh;
+                    hv_l[il] += vrh * vrh;
+                    tv_l[il] += vrt * vrt;
+                    gam_l[il] += vrh * vrt;
                     if (omni) {
                         np_arr[il] += 1.0;
-                        dis[il] += h;
-                        tm[il] += vrtpr;
-                        hm[il] += vrhpr;
-                        hv[il] += vrhpr * vrhpr;
-                        tv[il] += vrtpr * vrtpr;
-                        gam[il] += vrhpr * vrtpr;
+                        dis_l[il] += h;
+                        tm_l[il] += vrtpr;
+                        hm_l[il] += vrhpr;
+                        hv_l[il] += vrhpr * vrhpr;
+                        tv_l[il] += vrtpr * vrtpr;
+                        gam_l[il] += vrhpr * vrtpr;
                     }
                 }
             } else if (it == 6) {
-                // Pairwise relative
                 for (int il = lagbeg; il <= lagend; il++) {
                     if (std::abs(vrt + vrh) > 1.0e-20) {
                         np_arr[il] += 1.0;
-                        dis[il] += h;
-                        tm[il] += vrt;
-                        hm[il] += vrh;
+                        dis_l[il] += h;
+                        tm_l[il] += vrt;
+                        hm_l[il] += vrh;
                         double gamma = 2.0 * (vrt - vrh) / (vrt + vrh);
-                        gam[il] += gamma * gamma;
+                        gam_l[il] += gamma * gamma;
                     }
                 }
             } else if (it == 7) {
-                // Log variogram
                 for (int il = lagbeg; il <= lagend; il++) {
                     if (vrt > 1.0e-20 && vrh > 1.0e-20) {
                         np_arr[il] += 1.0;
-                        dis[il] += h;
-                        tm[il] += vrt;
-                        hm[il] += vrh;
+                        dis_l[il] += h;
+                        tm_l[il] += vrt;
+                        hm_l[il] += vrh;
                         double gamma = std::log(vrt) - std::log(vrh);
-                        gam[il] += gamma * gamma;
+                        gam_l[il] += gamma * gamma;
                     }
                 }
             } else if (it == 8) {
-                // Madogram
                 for (int il = lagbeg; il <= lagend; il++) {
                     np_arr[il] += 1.0;
-                    dis[il] += h;
-                    tm[il] += vrt;
-                    hm[il] += vrh;
-                    gam[il] += std::abs(vrh - vrt);
+                    dis_l[il] += h;
+                    tm_l[il] += vrt;
+                    hm_l[il] += vrh;
+                    gam_l[il] += std::abs(vrh - vrt);
                     if (omni) {
                         np_arr[il] += 1.0;
-                        dis[il] += h;
-                        tm[il] += vrtpr;
-                        hm[il] += vrhpr;
-                        gam[il] += std::abs(vrhpr - vrtpr);
+                        dis_l[il] += h;
+                        tm_l[il] += vrtpr;
+                        hm_l[il] += vrhpr;
+                        gam_l[il] += std::abs(vrhpr - vrtpr);
                     }
                 }
             }
+        }
+    }
+
+    // Merge thread-local accumulators
+    std::vector<double> np_arr(nbins, 0.0), dis(nbins, 0.0), gam(nbins, 0.0);
+    std::vector<double> hm(nbins, 0.0), tm(nbins, 0.0), hv(nbins, 0.0), tv(nbins, 0.0);
+    for (int t = 0; t < nthreads; t++) {
+        for (int il = 0; il < nbins; il++) {
+            np_arr[il] += t_np[t][il];
+            dis[il]    += t_dis[t][il];
+            gam[il]    += t_gam[t][il];
+            hm[il]     += t_hm[t][il];
+            tm[il]     += t_tm[t][il];
+            hv[il]     += t_hv[t][il];
+            tv[il]     += t_tv[t][il];
         }
     }
 
@@ -292,7 +324,7 @@ VariogramResult gamv(
         }
     }
 
-    // Build result: skip bin 0 (zero-distance), return bins 1..n_lags+1
+    // Build result
     VariogramResult result;
     result.lags.resize(n_lags);
     result.semivariance.resize(n_lags);
@@ -303,7 +335,7 @@ VariogramResult gamv(
     result.tail_var.resize(n_lags);
 
     for (int il = 0; il < n_lags; il++) {
-        int bin = il + 1;  // bins 1..n_lags
+        int bin = il + 1;
         result.pair_counts[il] = static_cast<int>(np_arr[bin]);
         if (np_arr[bin] > 0) {
             result.lags[il] = dis[bin];

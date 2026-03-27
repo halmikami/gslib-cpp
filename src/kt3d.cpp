@@ -3,16 +3,39 @@
 #include "setrot.h"
 #include "sqdist.h"
 #include "cova3.h"
+#include <nanoflann.hpp>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
 #include <vector>
+#include <array>
 
 namespace gslib {
 
-// Simple Gauss elimination solver for symmetric positive-definite kriging system
+// KDTree adaptor for 3D point cloud
+struct PointCloud {
+    const std::vector<double>* px;
+    const std::vector<double>* py;
+    const std::vector<double>* pz;
+
+    inline size_t kdtree_get_point_count() const { return px->size(); }
+
+    inline double kdtree_get_pt(const size_t idx, const size_t dim) const {
+        if (dim == 0) return (*px)[idx];
+        if (dim == 1) return (*py)[idx];
+        return (*pz)[idx];
+    }
+
+    template <class BBOX>
+    bool kdtree_get_bbox(BBOX&) const { return false; }
+};
+
+using KDTree = nanoflann::KDTreeSingleIndexAdaptor<
+    nanoflann::L2_Simple_Adaptor<double, PointCloud>,
+    PointCloud, 3>;
+
+// Simple Gauss elimination solver for kriging system
 static bool ktsol(int neq, std::vector<double>& a, std::vector<double>& r) {
-    // Forward elimination
     for (int k = 0; k < neq - 1; k++) {
         double akk = a[k * neq + k];
         if (std::abs(akk) < 1.0e-20) return false;
@@ -24,7 +47,6 @@ static bool ktsol(int neq, std::vector<double>& a, std::vector<double>& r) {
             r[i] -= factor * r[k];
         }
     }
-    // Back substitution
     for (int i = neq - 1; i >= 0; i--) {
         double aii = a[i * neq + i];
         if (std::abs(aii) < 1.0e-20) return false;
@@ -73,17 +95,14 @@ KrigingResult kt3d(
     if (search_radius2 < 0.0) search_radius2 = search_radius;
     if (search_radius3 < 0.0) search_radius3 = search_radius;
 
-    // Compute anisotropy ratios for search
     double sanis1 = search_radius2 / std::max(search_radius, EPSLON);
     double sanis2 = search_radius3 / std::max(search_radius, EPSLON);
 
-    // Build variogram parameter arrays (single variogram, ivarg=0)
     std::vector<double> c0_arr = {nugget};
     std::vector<int> it_arr = model_types;
     std::vector<double> cc_arr = model_cc;
     std::vector<double> aa_arr = model_aa;
 
-    // Build anisotropy ratios for variogram structures
     std::vector<double> anis1_arr(nst), anis2_arr(nst);
     std::vector<double> vang1(nst, 0.0), vang2(nst, 0.0), vang3(nst, 0.0);
 
@@ -97,7 +116,6 @@ KrigingResult kt3d(
         if (i < static_cast<int>(model_ang3.size())) vang3[i] = model_ang3[i];
     }
 
-    // Set up rotation matrices: nst structures + 1 for search
     int maxrot = nst + 1;
     std::vector<double> rotmat(maxrot * 9, 0.0);
 
@@ -111,14 +129,12 @@ KrigingResult kt3d(
             covmax += cc_arr[is];
         }
     }
-    // Search rotation matrix
     int isrot = nst;
     setrot(sang1, sang2, sang3, sanis1, sanis2, isrot, maxrot, rotmat);
 
     double radsqd = search_radius * search_radius;
-    double unbias = covmax;  // For unbiasedness constraint scaling
+    double unbias = covmax;
 
-    // Point kriging: cbb = point covariance at zero distance
     auto cov_result = cova3(0, 0, 0, 0, 0, 0,
                             0, nst, c0_arr, it_arr, cc_arr, aa_arr,
                             0, maxrot, rotmat);
@@ -128,21 +144,43 @@ KrigingResult kt3d(
     result.estimates.resize(nout, unest);
     result.variances.resize(nout, unest);
 
+    // Build KDTree for input data points
+    PointCloud cloud{&x, &y, &z};
+    KDTree kdtree(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+
+    // Determine isotropic search: use max of all radii as KDTree radius,
+    // then filter with anisotropic sqdist
+    double max_radius = std::max({search_radius, search_radius2, search_radius3});
+    double kd_radsqd = max_radius * max_radius;
+
+    // Candidate buffer: fetch more than ndmax from KDTree to account for
+    // anisotropic filtering
+    int kd_nmax = std::min(nd, std::max(ndmax * 4, 64));
+
     // Main loop over output locations
     for (int idx = 0; idx < nout; idx++) {
         double xloc = xout[idx];
         double yloc = yout[idx];
         double zloc = zout[idx];
 
-        // Find nearby samples using search ellipsoid
+        // KDTree radius search
+        double query_pt[3] = {xloc, yloc, zloc};
+        nanoflann::SearchParameters search_params;
+        search_params.sorted = false;
+
+        std::vector<nanoflann::ResultItem<uint32_t, double>> kd_matches;
+        size_t n_found = kdtree.radiusSearch(query_pt, kd_radsqd, kd_matches, search_params);
+
+        // Filter by anisotropic search ellipsoid and collect with true distance
         struct NearSample {
             int index;
             double dist;
         };
         std::vector<NearSample> nearby;
-        nearby.reserve(nd);
+        nearby.reserve(n_found);
 
-        for (int i = 0; i < nd; i++) {
+        for (size_t k = 0; k < n_found; k++) {
+            int i = static_cast<int>(kd_matches[k].first);
             double hsqd = sqdist(x[i], y[i], z[i], xloc, yloc, zloc,
                                  isrot, maxrot, rotmat);
             if (hsqd <= radsqd) {
@@ -150,13 +188,13 @@ KrigingResult kt3d(
             }
         }
 
-        // Sort by distance
+        // Sort by anisotropic distance
         std::sort(nearby.begin(), nearby.end(),
                   [](const NearSample& a, const NearSample& b) {
                       return a.dist < b.dist;
                   });
 
-        // Octant search if requested
+        // Octant search
         if (noct > 0 && static_cast<int>(nearby.size()) > ndmax) {
             std::vector<int> oct_count(8, 0);
             std::vector<NearSample> filtered;
@@ -175,11 +213,9 @@ KrigingResult kt3d(
             nearby = std::move(filtered);
         }
 
-        // Limit to ndmax
         int na = std::min(static_cast<int>(nearby.size()), ndmax);
         if (na < ndmin) continue;
 
-        // Build local coordinate arrays (relative to estimation point)
         std::vector<double> xa(na), ya(na), za(na), vra(na);
         for (int i = 0; i < na; i++) {
             int ind = nearby[i].index;
@@ -189,7 +225,7 @@ KrigingResult kt3d(
             vra[i] = values[ind];
         }
 
-        // Handle single sample case
+        // Single sample case
         if (na == 1) {
             auto cr1 = cova3(xa[0], ya[0], za[0], xa[0], ya[0], za[0],
                              0, nst, c0_arr, it_arr, cc_arr, aa_arr,
@@ -205,13 +241,12 @@ KrigingResult kt3d(
         }
 
         // Set up kriging system
-        int neq = (ktype == 0) ? na : na + 1;  // OK adds unbiasedness constraint
+        int neq = (ktype == 0) ? na : na + 1;
 
         std::vector<double> a_mat(neq * neq, 0.0);
         std::vector<double> r_vec(neq, 0.0);
         std::vector<double> rr(neq, 0.0);
 
-        // Fill covariance matrix
         for (int i = 0; i < na; i++) {
             for (int j = i; j < na; j++) {
                 auto cr = cova3(xa[i], ya[i], za[i], xa[j], ya[j], za[j],
@@ -222,7 +257,6 @@ KrigingResult kt3d(
             }
         }
 
-        // Unbiasedness constraints for OK
         if (ktype == 1) {
             for (int i = 0; i < na; i++) {
                 a_mat[i * neq + na] = unbias;
@@ -230,7 +264,6 @@ KrigingResult kt3d(
             }
         }
 
-        // Right-hand side: covariance between data and estimation point
         for (int i = 0; i < na; i++) {
             auto cr = cova3(xa[i], ya[i], za[i], xloc, yloc, zloc,
                             0, nst, c0_arr, it_arr, cc_arr, aa_arr,
@@ -241,16 +274,12 @@ KrigingResult kt3d(
             r_vec[na] = unbias;
         }
 
-        // Save RHS for variance computation
         rr = r_vec;
 
-        // Solve kriging system
         if (!ktsol(neq, a_mat, r_vec)) {
-            // Singular matrix
             continue;
         }
 
-        // Compute estimate and variance
         double est = 0.0;
         double estv = cbb;
         for (int j = 0; j < neq; j++) {

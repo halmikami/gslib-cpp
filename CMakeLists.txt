@@ -18,7 +18,10 @@ add_library(gslib_core STATIC
     src/declus.cpp
     src/sort.cpp
 )
-target_include_directories(gslib_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(gslib_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern
+)
 
 # OpenMP (optional)
 find_package(OpenMP)
@@ -59,6 +62,7 @@ if(GSLIB_BUILD_TESTS)
         tests/test_gamv.cpp
         tests/test_kt3d.cpp
         tests/test_declus.cpp
+        tests/test_numerical.cpp
     )
     target_link_libraries(test_gslib PRIVATE gslib_core GTest::gtest_main)
 
